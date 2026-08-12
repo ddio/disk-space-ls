@@ -405,6 +405,39 @@ def _query_docker():
         row = info.get(t)
         return parse_docker_size(row.get("Reclaimable", "")) if row else None
 
+    # image 清單 (只讀 metadata,很快)。先查哪些 image 有容器在用
+    used = set()
+    images = []
+    try:
+        ps = subprocess.run(["docker", "ps", "-aq"],
+                            capture_output=True, text=True, timeout=30)
+        ids = ps.stdout.split()
+        if ids:
+            insp = subprocess.run(["docker", "inspect", "-f", "{{.Image}}", *ids],
+                                  capture_output=True, text=True, timeout=30)
+            used = {l.strip().removeprefix("sha256:")[:12]
+                    for l in insp.stdout.splitlines() if l.strip()}
+        out = subprocess.run(["docker", "images", "--format", "{{json .}}"],
+                             capture_output=True, text=True, timeout=60)
+        for line in out.stdout.splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            images.append({
+                "repo": row.get("Repository", "<none>"),
+                "tag": row.get("Tag", "<none>"),
+                "id": row.get("ID", ""),
+                "size": parse_docker_size(row.get("Size", "")),
+                "size_h": row.get("Size", "?"),
+                "created": row.get("CreatedSince", "?"),
+                "in_use": row.get("ID", "")[:12] in used,
+            })
+        images.sort(key=lambda i: -(i["size"] or 0))
+    except Exception:
+        pass
+    info["images"] = images
+
     # dangling image (沒 tag 的中間層) — 安全
     try:
         out = subprocess.run(
@@ -540,6 +573,8 @@ def main():
                     help="專案幾天沒動視為停滯 (預設 90)")
     ap.add_argument("--exclude", action="append", default=[],
                     help="排除的 glob pattern,可重複")
+    ap.add_argument("--top-images", type=int, default=15,
+                    help="Docker image 清單顯示數量,0=全部 (預設 15)")
     ap.add_argument("--no-docker", action="store_true")
     ap.add_argument("--no-system", action="store_true")
     ap.add_argument("--json", action="store_true", help="輸出 JSON")
@@ -619,6 +654,19 @@ def main():
                 print(f"  {t:<14} {row.get('TotalCount', '?'):>4} 個, "
                       f"共 {row.get('Size', '?'):>10}, "
                       f"可回收 {row.get('Reclaimable', '?')}")
+        imgs = docker_info.get("images") or []
+        if imgs:
+            n = args.top_images if args.top_images > 0 else len(imgs)
+            unused = sum(1 for im in imgs if not im["in_use"])
+            print(f"\n  Image 清單 (依大小,前 {min(n, len(imgs))} 個;"
+                  f"共 {len(imgs)} 個,其中 {unused} 個沒有容器在用):")
+            for im in imgs[:n]:
+                mark = "使用中" if im["in_use"] else "未使用"
+                print(f"    {im['size_h']:>10}  [{mark}]  "
+                      f"{im['repo']}:{im['tag']}  ({im['created']})")
+            if len(imgs) > n:
+                print(f"    ... 還有 {len(imgs) - n} 個,完整清單: docker images")
+            print("    (image 之間會共用 layer,大小加總會大於實際磁碟用量)")
     elif docker_info.get("error"):
         print(f"\n== Docker ==\n  ({docker_info['error']})")
 

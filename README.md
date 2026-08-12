@@ -13,6 +13,7 @@ dsls --path ~/src       # 掃指定目錄 (清理建議僅在掃 $HOME 時產生
 dsls --depth 3          # 目錄樹顯示深度 (預設 2)
 dsls --min-size 500     # 目錄樹只顯示 >500MB 的目錄 (預設 100)
 dsls --stale-days 30    # 專案幾天沒動視為停滯 (預設 90)
+dsls --top-images 30    # Docker image 清單顯示數量,0=全部 (預設 15)
 dsls --exclude 'SynologyDrive' --exclude '*.git'   # 排除 glob
 dsls --no-docker --no-system                       # 只掃檔案
 dsls --clear-cache      # 清掉快取
@@ -48,6 +49,7 @@ dsls --clear-cache      # 清掉快取
 | 下載區舊大檔 | `~/Downloads`、`~/下載` 中 >100MB 且超過 180 天 | 中 |
 | 家目錄大 log | `~/*.log` >20MB | 中 |
 | Docker | dangling image（低）、unused image（中）、build cache（低）、停止的容器（中）、未掛載 volume（**高**，可能有資料庫資料） | 低–高 |
+| Docker image 清單 | 依大小列出各 image、建立時間、是否有容器在用（`--top-images` 控制數量） | — |
 | 系統 | journald >500MB、apt cache >100MB、停用的舊版 snap | 低 |
 
 「必須在 git repo 內」是為了避免誤刪 VS Code extension、`.nvm`、安裝版 app
