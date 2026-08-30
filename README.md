@@ -28,8 +28,11 @@ dsls --clear-cache      # 清掉快取
 
 - **目錄樹快取**（`~/.cache/disk-space-ls/tree-cache.json`）：記錄每個目錄的
   mtime、直屬檔案大小、子目錄清單。目錄 mtime 沒變就整包沿用，只 stat 目錄本身。
-- **Docker 快取**：`docker system df` 需要即時計算所有 image/volume，可能跑數分鐘，
-  結果快取 12 小時；它同時也和檔案掃描平行執行，不會疊加等待時間。
+- **Docker**：每次執行只跑毫秒級的 metadata 查詢（image 清單、container/volume 數量、
+  `docker builder du`）。很慢的 `docker system df`（要即時 du 所有 container rw layer
+  與 volume，實測近 2 分鐘）改由 detached 背景行程更新，結果快取 12 小時，主程式
+  **從不等它**——快取還沒好時，container/volume 的精確大小顯示「背景計算中」，下次執行
+  補上。只有 `--full` 會同步等 df 跑完。
 - 已知限制：檔案「原地變大」（如 log append）不會改變目錄 mtime，要等該目錄有
   增刪檔案、或跑 `--full` 才會反映。所以建議定期 `--full` 一次。
 
@@ -48,7 +51,7 @@ dsls --clear-cache      # 清掉快取
 | 停滯專案建置產物 | `node_modules` / `venv` / `.venv` / `target` / `.next` 等，**必須在 git repo 內**且有對應標記檔（package.json…），整個專案超過 `--stale-days` 沒動 | 低 |
 | 下載區舊大檔 | `~/Downloads`、`~/下載` 中 >100MB 且超過 180 天 | 中 |
 | 家目錄大 log | `~/*.log` >20MB | 中 |
-| Docker | dangling image（低）、unused image（中）、build cache（低）、停止的容器（中）、未掛載 volume（**高**，可能有資料庫資料） | 低–高 |
+| Docker | dangling image（低）、unused image（中）、build cache `docker builder prune -a -f`（低，含還在用的層，下次 build 慢一次）、停止的容器（中）、未掛載 volume（**高**，可能有資料庫資料） | 低–高 |
 | Docker image 清單 | 依大小列出各 image、建立時間、是否有容器在用（`--top-images` 控制數量） | — |
 | 系統 | journald >500MB、apt cache >100MB、停用的舊版 snap | 低 |
 

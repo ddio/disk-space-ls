@@ -360,65 +360,112 @@ def suggest_home(scanner, args):
 
 DOCKER_CACHE_FILE = os.path.join(CACHE_DIR, "docker-df.json")
 DOCKER_CACHE_TTL = 12 * 3600  # docker system df 很慢,結果快取 12 小時
+DOCKER_REFRESH_MARKER = DOCKER_CACHE_FILE + ".refreshing"
 
 
-def suggest_docker(force=False):
-    if not force:
-        try:
-            with open(DOCKER_CACHE_FILE) as f:
-                cached = json.load(f)
-            if time.time() - cached["at"] < DOCKER_CACHE_TTL:
-                return cached["s"], cached["info"]
-        except (OSError, ValueError, KeyError):
-            pass
-    s, info = _query_docker()
-    if "error" not in info:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        tmp = DOCKER_CACHE_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"at": time.time(), "s": s, "info": info}, f)
-        os.replace(tmp, DOCKER_CACHE_FILE)
-    return s, info
+def _docker_run(cmd, timeout):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
-def _query_docker():
-    s = []
-    info = {}
+def _query_df():
+    """docker system df — 會即時 du 所有 container rw layer 與 volume,常跑數分鐘。
+    只在 --full 或背景更新時呼叫,一般執行只用它的快取。"""
     try:
-        # docker system df 要即時計算所有 image/volume 大小,可能跑很久
-        out = subprocess.run(
-            ["docker", "system", "df", "--format", "{{json .}}"],
-            capture_output=True, text=True, timeout=300,
-        )
+        out = _docker_run(["docker", "system", "df", "--format", "{{json .}}"], 600)
         if out.returncode != 0:
-            return s, {"error": out.stderr.strip()[:200] or "docker system df 失敗"}
+            return None
+        rows = {}
         for line in out.stdout.splitlines():
             try:
                 row = json.loads(line)
-                info[row.get("Type", "?")] = row
+                rows[row.get("Type", "?")] = row
             except ValueError:
                 pass
+        return rows or None
+    except Exception:
+        return None
+
+
+def _load_df_cache():
+    try:
+        with open(DOCKER_CACHE_FILE) as f:
+            cached = json.load(f)
+        if time.time() - cached["at"] < DOCKER_CACHE_TTL:
+            return cached["df"]
+    except (OSError, ValueError, KeyError):
+        pass
+    return None
+
+
+def _save_df_cache(rows):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    tmp = DOCKER_CACHE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"at": time.time(), "df": rows}, f)
+    os.replace(tmp, DOCKER_CACHE_FILE)
+
+
+def _spawn_df_refresh():
+    """另起 detached 行程更新 df 快取,本次執行不等它。"""
+    try:
+        if time.time() - os.path.getmtime(DOCKER_REFRESH_MARKER) < 15 * 60:
+            return  # 已有一個背景更新在跑
+    except OSError:
+        pass
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(DOCKER_REFRESH_MARKER, "w") as f:
+        f.write(str(time.time()))
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--docker-df-refresh"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def suggest_docker(force=False):
+    s, info = _query_docker_fast()
+    if "error" in info:
+        return s, info
+    df = None if force else _load_df_cache()
+    if df is None and force:
+        df = _query_df()  # --full 明確要求完整,同步等
+        if df:
+            _save_df_cache(df)
+    if df:
+        info.update(df)
+    else:
+        info["df_pending"] = True
+        _spawn_df_refresh()
+    _suggest_docker_items(s, info)
+    return s, info
+
+
+def _query_docker_fast():
+    """只讀 metadata 的查詢,全部毫秒級;不碰要 du 磁碟的 docker system df。"""
+    s = []
+    info = {}
+    try:
+        ps = _docker_run(["docker", "ps", "-aq"], 30)
+        if ps.returncode != 0:
+            return s, {"error": ps.stderr.strip()[:200] or "docker 無法使用"}
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         return s, {"error": f"docker 無法使用: {e.__class__.__name__}"}
+    ids = ps.stdout.split()
+    info["containers_total"] = len(ids)
+    try:
+        info["containers_running"] = len(_docker_run(["docker", "ps", "-q"], 30).stdout.split())
+    except Exception:
+        info["containers_running"] = None
 
-    def reclaimable(t):
-        row = info.get(t)
-        return parse_docker_size(row.get("Reclaimable", "")) if row else None
-
-    # image 清單 (只讀 metadata,很快)。先查哪些 image 有容器在用
+    # image 清單。先查哪些 image 有容器在用
     used = set()
     images = []
     try:
-        ps = subprocess.run(["docker", "ps", "-aq"],
-                            capture_output=True, text=True, timeout=30)
-        ids = ps.stdout.split()
         if ids:
-            insp = subprocess.run(["docker", "inspect", "-f", "{{.Image}}", *ids],
-                                  capture_output=True, text=True, timeout=30)
+            insp = _docker_run(["docker", "inspect", "-f", "{{.Image}}", *ids], 30)
             used = {l.strip().removeprefix("sha256:")[:12]
                     for l in insp.stdout.splitlines() if l.strip()}
-        out = subprocess.run(["docker", "images", "--format", "{{json .}}"],
-                             capture_output=True, text=True, timeout=60)
+        out = _docker_run(["docker", "images", "--format", "{{json .}}"], 60)
         for line in out.stdout.splitlines():
             try:
                 row = json.loads(line)
@@ -438,40 +485,75 @@ def _query_docker():
         pass
     info["images"] = images
 
+    # volume 數量 (大小要靠 df,這裡只數)
+    try:
+        info["volumes_total"] = len(_docker_run(["docker", "volume", "ls", "-q"], 30).stdout.split())
+        info["volumes_dangling"] = len(
+            _docker_run(["docker", "volume", "ls", "-f", "dangling=true", "-q"], 30).stdout.split())
+    except Exception:
+        info["volumes_total"] = info["volumes_dangling"] = None
+
+    # build cache 總量: docker builder du 只讀 buildkit 記錄,不 du 磁碟
+    info["build_cache_bytes"] = None
+    try:
+        out = _docker_run(["docker", "builder", "du"], 60)
+        m = re.search(r"^Total:\s*([\d.]+\s*[kKMGT]?i?B)", out.stdout, re.M)
+        if m:
+            info["build_cache_bytes"] = parse_docker_size(m.group(1))
+    except Exception:
+        pass
+
     # dangling image (沒 tag 的中間層) — 安全
     try:
-        out = subprocess.run(
-            ["docker", "images", "-f", "dangling=true", "-q"],
-            capture_output=True, text=True, timeout=30,
-        )
-        n_dangling = len([l for l in out.stdout.splitlines() if l.strip()])
+        out = _docker_run(["docker", "images", "-f", "dangling=true", "-q"], 30)
+        info["n_dangling"] = len([l for l in out.stdout.splitlines() if l.strip()])
     except Exception:
-        n_dangling = 0
-    if n_dangling:
+        info["n_dangling"] = 0
+    return s, info
+
+
+def _suggest_docker_items(s, info):
+    """由快速查詢 (必要時輔以 df 快取) 產生建議。"""
+    def reclaimable(t):
+        row = info.get(t)
+        return parse_docker_size(row.get("Reclaimable", "")) if row else None
+
+    if info.get("n_dangling"):
         add(s, "Docker", "dangling images", None,
-            f"{n_dangling} 個沒有 tag 的 image 層", "docker image prune -f", "low")
+            f"{info['n_dangling']} 個沒有 tag 的 image 層", "docker image prune -f", "low")
 
     r = reclaimable("Images")
+    approx = ""
+    if r is None:
+        r = sum(im["size"] or 0 for im in info.get("images", []) if not im["in_use"])
+        approx = " (估計值,image 間共用 layer 時實際較少)"
     if r and r > 100 << 20:
         add(s, "Docker", "unused images", r,
-            "沒有任何容器在用的 image (需要時可重新 pull/build)",
+            "沒有任何容器在用的 image (需要時可重新 pull/build)" + approx,
             "docker image prune -a", "medium")
-    r = reclaimable("Build Cache")
+
+    # df 的 Build Cache Reclaimable 常是 0B (只算 dangling 的);-a 可清掉全部
+    r = info.get("build_cache_bytes") or reclaimable("Build Cache")
     if r and r > 100 << 20:
-        add(s, "Docker", "build cache", r, "build cache,可重建",
-            "docker builder prune", "low")
+        add(s, "Docker", "build cache", r,
+            "build cache 可重建;-a 連還在用的層一起清,下次 build 會慢一次",
+            "docker builder prune -a -f", "low")
+
     r = reclaimable("Containers")
-    if r and r > 50 << 20:
+    n_stopped = (info.get("containers_total") or 0) - (info.get("containers_running") or 0)
+    if (r and r > 50 << 20) or (r is None and n_stopped > 0):
         add(s, "Docker", "stopped containers", r,
-            "已停止的容器 (確認沒有要保留的資料/設定再刪)",
+            f"{n_stopped} 個已停止的容器 (確認沒有要保留的資料/設定再刪)",
             "docker container prune", "medium")
+
     r = reclaimable("Local Volumes")
-    if r and r > 50 << 20:
+    nd = info.get("volumes_dangling")
+    if (r and r > 50 << 20) or (r is None and nd):
         add(s, "Docker", "unused volumes", r,
-            "沒被任何容器掛載的 volume — 裡面可能有資料庫等資料,務必確認!",
+            f"{nd if nd is not None else '?'} 個沒被任何容器掛載的 volume"
+            " — 裡面可能有資料庫等資料,務必確認!",
             "docker volume ls -f dangling=true  # 先看清單再 docker volume prune",
             "high")
-    return s, info
 
 
 def suggest_system():
@@ -578,7 +660,18 @@ def main():
     ap.add_argument("--no-docker", action="store_true")
     ap.add_argument("--no-system", action="store_true")
     ap.add_argument("--json", action="store_true", help="輸出 JSON")
+    ap.add_argument("--docker-df-refresh", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    if args.docker_df_refresh:  # 內部用: 背景更新 docker system df 快取
+        rows = _query_df()
+        if rows:
+            _save_df_cache(rows)
+        try:
+            os.remove(DOCKER_REFRESH_MARKER)
+        except OSError:
+            pass
+        return
 
     if args.clear_cache:
         shutil.rmtree(CACHE_DIR, ignore_errors=True)
@@ -588,7 +681,8 @@ def main():
     root = os.path.realpath(args.path)
     t0 = time.time()
 
-    # docker system df 很慢,先在背景跑,與檔案掃描平行
+    # docker 查詢與檔案掃描平行;一般執行只跑毫秒級 metadata 查詢,
+    # 慢的 docker system df 由 detached 背景行程更新快取,這裡不等它
     docker_result = {}
     docker_thread = None
     if not args.no_docker:
@@ -608,16 +702,17 @@ def main():
     docker_info = {}
     if docker_thread:
         if docker_thread.is_alive() and sys.stderr.isatty() and not args.json:
-            sys.stderr.write("等待 docker system df...\r")
+            sys.stderr.write("等待 docker 查詢...\r")
             sys.stderr.flush()
-        docker_thread.join(timeout=300)
+        # --full 會同步跑 docker system df (可能數分鐘),其餘只是 metadata 查詢
+        docker_thread.join(timeout=660 if args.full else 120)
         if sys.stderr.isatty() and not args.json:
             sys.stderr.write("\033[K")
         if docker_result:
             suggestions += docker_result.get("s", [])
             docker_info = docker_result.get("info", {})
         else:
-            docker_info = {"error": "docker system df 超過 5 分鐘沒回應,略過"}
+            docker_info = {"error": "docker 查詢逾時,略過"}
     if not args.no_system:
         suggestions += suggest_system()
 
@@ -654,6 +749,19 @@ def main():
                 print(f"  {t:<14} {row.get('TotalCount', '?'):>4} 個, "
                       f"共 {row.get('Size', '?'):>10}, "
                       f"可回收 {row.get('Reclaimable', '?')}")
+        if docker_info.get("df_pending"):
+            ct = docker_info.get("containers_total")
+            cr = docker_info.get("containers_running") or 0
+            vt = docker_info.get("volumes_total")
+            vd = docker_info.get("volumes_dangling")
+            print(f"  Images         {len(docker_info.get('images') or []):>4} 個")
+            if ct is not None:
+                print(f"  Containers     {ct:>4} 個 (其中 {ct - cr} 個已停止)")
+            if vt is not None:
+                print(f"  Local Volumes  {vt:>4} 個 (其中 {vd} 個未掛載)")
+            if docker_info.get("build_cache_bytes") is not None:
+                print(f"  Build Cache    共 {human(docker_info['build_cache_bytes'])}")
+            print("  (精確大小由 docker system df 在背景計算,下次執行會顯示)")
         imgs = docker_info.get("images") or []
         if imgs:
             n = args.top_images if args.top_images > 0 else len(imgs)
